@@ -2,6 +2,7 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/peekapi-dev/sdk-go.svg)](https://pkg.go.dev/github.com/peekapi-dev/sdk-go)
 [![license](https://img.shields.io/github/license/peekapi-dev/sdk-go)](./LICENSE)
+[![CI](https://github.com/peekapi-dev/sdk-go/actions/workflows/ci.yml/badge.svg)](https://github.com/peekapi-dev/sdk-go/actions/workflows/ci.yml)
 
 Zero-dependency Go SDK for [PeekAPI](https://peekapi.dev). Standard `net/http` middleware plus adapters for Gin, Echo, Chi, and Fiber.
 
@@ -159,6 +160,14 @@ if err := client.Shutdown(ctx); err != nil {
 - **Consumer ID hashing** — Authorization headers hashed with SHA-256
 - **Graceful shutdown** — context-based with SIGTERM/SIGINT handlers
 - **Standard middleware** — `func(http.Handler) http.Handler` works with any router
+
+## Contributing
+
+1. Fork & clone the repo
+2. Run tests — `go test ./...`
+3. Lint — `go vet ./...`
+4. Format — `gofmt -w .`
+5. Submit a PR
 
 ## License
 
