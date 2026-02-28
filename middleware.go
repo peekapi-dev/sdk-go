@@ -1,10 +1,7 @@
-package apidash
+package peekapi
 
 import (
-	"fmt"
-	"math"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -29,36 +26,7 @@ func Middleware(client *Client) func(http.Handler) http.Handler {
 
 			next.ServeHTTP(rw, r)
 
-			// Track the request, but never let analytics errors crash the handler.
-			// Deferred recover catches panics from IdentifyConsumer or Track.
-			func() {
-				defer func() {
-					if rec := recover(); rec != nil && client.opts.Debug {
-						fmt.Fprintf(os.Stderr, "[apidash] Panic in middleware (recovered): %v\n", rec)
-					}
-				}()
-
-				duration := time.Since(start)
-
-				consumerID := identifyConsumer(client.opts, r)
-
-				// Request size: use ContentLength if available
-				requestSize := 0
-				if r.ContentLength > 0 {
-					requestSize = int(r.ContentLength)
-				}
-
-				client.Track(RequestEvent{
-					Method:         r.Method,
-					Path:           r.URL.Path,
-					StatusCode:     rw.statusCode,
-					ResponseTimeMs: math.Round(float64(duration.Microseconds())/10) / 100, // 2 decimal places
-					RequestSize:    requestSize,
-					ResponseSize:   rw.bytesWritten,
-					ConsumerID:     consumerID,
-					Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
-				})
-			}()
+			client.TrackRequest(r, rw.statusCode, rw.bytesWritten, start)
 		})
 	}
 }

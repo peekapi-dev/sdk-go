@@ -1,3 +1,3 @@
-module github.com/api-usage-dashboard/sdk-go
+module github.com/peekapi-dev/sdk-go
 
 go 1.22

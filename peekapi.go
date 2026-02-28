@@ -1,8 +1,8 @@
-// Package apidash provides an API analytics SDK that captures HTTP request
+// Package peekapi provides an API analytics SDK that captures HTTP request
 // events, buffers them in memory, and flushes them in batches to an ingestion
 // endpoint. It includes exponential backoff on failures, disk persistence for
 // undelivered events, and SSRF protection.
-package apidash
+package peekapi
 
 import (
 	"bufio"
@@ -29,9 +29,14 @@ import (
 	"time"
 )
 
+// Version is the SDK version sent via the x-peekapi-sdk header.
+const Version = "0.1.0"
+
+const DefaultEndpoint = "https://ingest.peekapi.dev/v1/events"
+
 const (
-	defaultFlushInterval   = 10 * time.Second
-	defaultBatchSize       = 100
+	defaultFlushInterval   = 15 * time.Second
+	defaultBatchSize       = 250
 	defaultMaxBufferSize   = 10_000
 	maxPathLength          = 2048
 	maxMethodLength        = 16
@@ -41,12 +46,13 @@ const (
 	defaultMaxStorageBytes = 5 * 1024 * 1024 // 5MB
 	sendTimeout            = 5 * time.Second
 	dnsCacheTTL            = 60 * time.Second
+	diskRecoveryInterval   = 60 * time.Second
 )
 
 // ErrEventsPersisted indicates that Shutdown could not deliver events to the
 // ingestion endpoint and they were persisted to the local disk file instead.
 // Callers can check for this with errors.Is(err, ErrEventsPersisted).
-var ErrEventsPersisted = fmt.Errorf("apidash: events persisted to disk, not delivered to endpoint")
+var ErrEventsPersisted = fmt.Errorf("peekapi: events persisted to disk, not delivered to endpoint")
 
 // jsonBufPool reuses bytes.Buffer instances for JSON marshaling in send(),
 // reducing GC pressure under high flush throughput.
@@ -112,13 +118,13 @@ type Options struct {
 	// APIKey is the API key used to authenticate with the ingestion endpoint (required).
 	APIKey string
 
-	// Endpoint is the URL of the ingestion endpoint (required).
+	// Endpoint is the URL of the ingestion endpoint. Default: PeekAPI cloud.
 	Endpoint string
 
-	// FlushInterval is the time between automatic flushes. Default: 10s.
+	// FlushInterval is the time between automatic flushes. Default: 15s.
 	FlushInterval time.Duration
 
-	// BatchSize is the number of events that triggers an automatic flush. Default: 100.
+	// BatchSize is the number of events that triggers an automatic flush. Default: 250.
 	BatchSize int
 
 	// MaxBufferSize is the maximum number of events held in memory. Default: 10,000.
@@ -133,7 +139,7 @@ type Options struct {
 	IdentifyConsumer func(r *http.Request) string
 
 	// StoragePath is the file path for persisting undelivered events.
-	// Default: os.TempDir()/apidash-events-<hash>.jsonl
+	// Default: os.TempDir()/peekapi-events-<hash>.jsonl
 	StoragePath string
 
 	// MaxStorageBytes is the maximum size of the storage file. Default: 5MB.
@@ -141,6 +147,10 @@ type Options struct {
 
 	// TLSConfig is an optional TLS configuration for the HTTP client.
 	TLSConfig *tls.Config
+
+	// CollectQueryString includes sorted query parameters in the tracked path.
+	// NOTE: increases DB usage — each unique path+query creates a separate endpoint row.
+	CollectQueryString bool
 
 	// OnError is an optional callback invoked when the background flush loop
 	// encounters an error (network failure, non-retryable status, etc.).
@@ -183,7 +193,8 @@ type Client struct {
 	stopped chan struct{} // closed when background goroutine exits
 	closed  bool
 
-	signalCh chan os.Signal // for graceful shutdown
+	signalCh         chan os.Signal // for graceful shutdown
+	lastDiskRecovery time.Time
 }
 
 // New creates a new Client with the given options. It validates the
@@ -191,42 +202,42 @@ type Client struct {
 // a background goroutine for periodic flushing.
 func New(opts Options) (*Client, error) {
 	if opts.Endpoint == "" {
-		return nil, fmt.Errorf("[apidash] 'Endpoint' is required")
+		opts.Endpoint = DefaultEndpoint
 	}
 
 	parsed, err := url.Parse(opts.Endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("[apidash] Invalid endpoint URL: %s", opts.Endpoint)
+		return nil, fmt.Errorf("[peekapi] Invalid endpoint URL: %s", opts.Endpoint)
 	}
 
 	if parsed.Scheme == "" || parsed.Host == "" {
-		return nil, fmt.Errorf("[apidash] Invalid endpoint URL: %s", opts.Endpoint)
+		return nil, fmt.Errorf("[peekapi] Invalid endpoint URL: %s", opts.Endpoint)
 	}
 
 	hostname := parsed.Hostname()
 	isLocalhost := hostname == "localhost" || hostname == "127.0.0.1"
 
 	if parsed.Scheme != "https" && !isLocalhost {
-		return nil, fmt.Errorf("[apidash] Endpoint must use HTTPS. Plain HTTP is only allowed for localhost.")
+		return nil, fmt.Errorf("[peekapi] Endpoint must use HTTPS. Plain HTTP is only allowed for localhost.")
 	}
 
 	if !isLocalhost && privateIPRe.MatchString(hostname) {
-		return nil, fmt.Errorf("[apidash] Endpoint must not point to a private or internal IP address.")
+		return nil, fmt.Errorf("[peekapi] Endpoint must not point to a private or internal IP address.")
 	}
 
 	// Strip embedded credentials
 	if parsed.User != nil {
 		parsed.User = nil
 		if opts.Debug {
-			fmt.Fprintln(os.Stderr, "[apidash] Stripped embedded credentials from endpoint URL")
+			fmt.Fprintln(os.Stderr, "[peekapi] Stripped embedded credentials from endpoint URL")
 		}
 	}
 
 	if opts.APIKey == "" {
-		return nil, fmt.Errorf("[apidash] 'APIKey' is required")
+		return nil, fmt.Errorf("[peekapi] 'APIKey' is required")
 	}
 	if strings.ContainsAny(opts.APIKey, "\r\n\x00") {
-		return nil, fmt.Errorf("[apidash] 'APIKey' contains invalid characters")
+		return nil, fmt.Errorf("[peekapi] 'APIKey' contains invalid characters")
 	}
 
 	// Apply defaults
@@ -246,7 +257,7 @@ func New(opts Options) (*Client, error) {
 	storagePath := opts.StoragePath
 	if storagePath == "" {
 		h := md5.Sum([]byte(opts.Endpoint))
-		storagePath = filepath.Join(os.TempDir(), fmt.Sprintf("apidash-events-%s.jsonl", hex.EncodeToString(h[:4])))
+		storagePath = filepath.Join(os.TempDir(), fmt.Sprintf("peekapi-events-%s.jsonl", hex.EncodeToString(h[:4])))
 	}
 
 	dialer := &net.Dialer{Timeout: 3 * time.Second}
@@ -293,7 +304,7 @@ func New(opts Options) (*Client, error) {
 		for _, ipStr := range ips {
 			ip := net.ParseIP(ipStr)
 			if ip != nil && isPrivateIPAddr(ip) {
-				return nil, fmt.Errorf("[apidash] DNS resolved to private IP %s (SSRF protection)", ipStr)
+				return nil, fmt.Errorf("[peekapi] DNS resolved to private IP %s (SSRF protection)", ipStr)
 			}
 		}
 
@@ -334,6 +345,7 @@ func New(opts Options) (*Client, error) {
 		stopped: make(chan struct{}),
 	}
 
+	c.lastDiskRecovery = time.Now()
 	c.loadFromDisk()
 	go c.backgroundLoop()
 	c.registerSignalHandlers()
@@ -387,7 +399,7 @@ func (c *Client) Flush() error {
 //
 // Locking strategy: mu protects flush state (flushInFlight, backoff),
 // bufMu protects buffer/spare. Track() only acquires bufMu, so it never
-// blocks on flush state or network I/O. Lock ordering: mu → bufMu.
+// blocks on flush state or network I/O. Lock ordering: mu -> bufMu.
 func (c *Client) FlushContext(ctx context.Context) error {
 	c.mu.Lock()
 	if c.flushInFlight {
@@ -440,7 +452,7 @@ func (c *Client) FlushContext(ctx context.Context) error {
 		c.backoffUntil = time.Time{}
 		recycleSpare()
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Flushed %d events\n", len(events))
+			fmt.Fprintf(os.Stderr, "[peekapi] Flushed %d events\n", len(events))
 		}
 		return nil
 	}
@@ -450,7 +462,7 @@ func (c *Client) FlushContext(ctx context.Context) error {
 		c.persistToDisk(events)
 		recycleSpare()
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Non-retryable error, persisted to disk: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[peekapi] Non-retryable error, persisted to disk: %v\n", err)
 		}
 		return err
 	}
@@ -482,7 +494,7 @@ func (c *Client) FlushContext(ctx context.Context) error {
 		}
 		c.bufMu.Unlock()
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Flush failed (attempt %d/%d): %v\n",
+			fmt.Fprintf(os.Stderr, "[peekapi] Flush failed (attempt %d/%d): %v\n",
 				c.consecutiveFailures, maxConsecutiveFailures, err)
 		}
 	}
@@ -568,16 +580,23 @@ func (c *Client) backgroundLoop() {
 	ticker := time.NewTicker(c.opts.FlushInterval)
 	defer ticker.Stop()
 
+	doFlushAndRecover := func() {
+		if err := c.Flush(); err != nil && c.opts.OnError != nil {
+			c.opts.OnError(err)
+		}
+		// Periodically recover persisted events from disk
+		if time.Since(c.lastDiskRecovery) >= diskRecoveryInterval {
+			c.lastDiskRecovery = time.Now()
+			c.loadFromDisk()
+		}
+	}
+
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.Flush(); err != nil && c.opts.OnError != nil {
-				c.opts.OnError(err)
-			}
+			doFlushAndRecover()
 		case <-c.flushCh:
-			if err := c.Flush(); err != nil && c.opts.OnError != nil {
-				c.opts.OnError(err)
-			}
+			doFlushAndRecover()
 		case <-c.done:
 			return
 		}
@@ -651,7 +670,7 @@ func (c *Client) persistToDisk(events []RequestEvent) {
 	}
 	if currentSize >= c.maxStorageBytes {
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Storage file full (%d bytes), skipping disk persist of %d events\n",
+			fmt.Fprintf(os.Stderr, "[peekapi] Storage file full (%d bytes), skipping disk persist of %d events\n",
 				currentSize, len(events))
 		}
 		return
@@ -660,7 +679,7 @@ func (c *Client) persistToDisk(events []RequestEvent) {
 	data, err := json.Marshal(events)
 	if err != nil {
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Failed to marshal events for disk: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[peekapi] Failed to marshal events for disk: %v\n", err)
 		}
 		return
 	}
@@ -668,7 +687,7 @@ func (c *Client) persistToDisk(events []RequestEvent) {
 	f, err := os.OpenFile(c.storagePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Failed to open storage file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[peekapi] Failed to open storage file: %v\n", err)
 		}
 		return
 	}
@@ -676,10 +695,10 @@ func (c *Client) persistToDisk(events []RequestEvent) {
 
 	if _, err := f.Write(append(data, '\n')); err != nil {
 		if c.opts.Debug {
-			fmt.Fprintf(os.Stderr, "[apidash] Failed to write events to disk: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[peekapi] Failed to write events to disk: %v\n", err)
 		}
 	} else if c.opts.Debug {
-		fmt.Fprintf(os.Stderr, "[apidash] Persisted %d events to %s\n", len(events), c.storagePath)
+		fmt.Fprintf(os.Stderr, "[peekapi] Persisted %d events to %s\n", len(events), c.storagePath)
 	}
 }
 
@@ -689,9 +708,8 @@ func (c *Client) loadFromDisk() {
 	if err != nil {
 		return // file doesn't exist or can't be read
 	}
-	defer f.Close()
 
-	loaded := 0
+	var events []RequestEvent
 	scanner := bufio.NewScanner(f)
 	// Increase scanner buffer for potentially large lines
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -705,23 +723,34 @@ func (c *Client) loadFromDisk() {
 		if err := json.Unmarshal([]byte(line), &batch); err != nil {
 			continue // skip corrupt lines
 		}
-		for _, event := range batch {
-			if len(c.buffer) >= c.opts.MaxBufferSize {
-				break
-			}
-			c.buffer = append(c.buffer, event)
-			loaded++
-		}
-		if len(c.buffer) >= c.opts.MaxBufferSize {
+		events = append(events, batch...)
+		if len(events) >= c.opts.MaxBufferSize {
+			events = events[:c.opts.MaxBufferSize]
 			break
 		}
 	}
 
-	f.Close() // close before removing
+	f.Close()
 	os.Remove(c.storagePath)
 
+	if len(events) == 0 {
+		return
+	}
+
+	// Insert recovered events under lock (safe for runtime calls)
+	c.bufMu.Lock()
+	space := c.opts.MaxBufferSize - len(c.buffer)
+	if space > len(events) {
+		space = len(events)
+	}
+	if space > 0 {
+		c.buffer = append(c.buffer, events[:space]...)
+	}
+	loaded := space
+	c.bufMu.Unlock()
+
 	if c.opts.Debug && loaded > 0 {
-		fmt.Fprintf(os.Stderr, "[apidash] Recovered %d events from disk\n", loaded)
+		fmt.Fprintf(os.Stderr, "[peekapi] Recovered %d events from disk\n", loaded)
 	}
 }
 
@@ -740,6 +769,7 @@ func (c *Client) send(ctx context.Context, events []RequestEvent) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.opts.APIKey)
+	req.Header.Set("x-peekapi-sdk", "go/"+Version)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -1,4 +1,4 @@
-package apidash
+package peekapi
 
 import (
 	"context"
@@ -21,7 +21,7 @@ import (
 // state leaking between tests.
 func tmpStoragePath(t *testing.T) string {
 	t.Helper()
-	return filepath.Join(t.TempDir(), "apidash-test.jsonl")
+	return filepath.Join(t.TempDir(), "peekapi-test.jsonl")
 }
 
 func makeEvent() RequestEvent {
@@ -56,11 +56,12 @@ func newTestClient(t *testing.T, serverURL string) *Client {
 
 // ─── Constructor Validation ──────────────────────────────────────────────────
 
-func TestNew_RequiresEndpoint(t *testing.T) {
-	_, err := New(Options{APIKey: "test"})
-	if err == nil || !strings.Contains(err.Error(), "Endpoint") {
-		t.Fatalf("expected Endpoint error, got: %v", err)
+func TestNew_EmptyEndpointUsesDefault(t *testing.T) {
+	c, err := New(Options{APIKey: "test"})
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
 	}
+	c.Shutdown(context.Background())
 }
 
 func TestNew_RequiresValidURL(t *testing.T) {
@@ -290,12 +291,14 @@ func TestFlush_SendsCorrectPayload(t *testing.T) {
 	var (
 		gotContentType string
 		gotAPIKey      string
+		gotSDKHeader   string
 		gotBody        []byte
 	)
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotContentType = r.Header.Get("Content-Type")
 		gotAPIKey = r.Header.Get("x-api-key")
+		gotSDKHeader = r.Header.Get("x-peekapi-sdk")
 		gotBody, _ = io.ReadAll(r.Body)
 		w.WriteHeader(200)
 	}))
@@ -310,6 +313,9 @@ func TestFlush_SendsCorrectPayload(t *testing.T) {
 	}
 	if gotAPIKey != "ak_test_key" {
 		t.Errorf("expected x-api-key ak_test_key, got %s", gotAPIKey)
+	}
+	if gotSDKHeader != "go/"+Version {
+		t.Errorf("expected x-peekapi-sdk go/%s, got %s", Version, gotSDKHeader)
 	}
 
 	var events []RequestEvent
@@ -864,6 +870,39 @@ func TestLoadFromDisk_MultiLineJSONL(t *testing.T) {
 
 	if c.BufferLen() != 3 {
 		t.Fatalf("expected 3 events from multi-line JSONL, got %d", c.BufferLen())
+	}
+}
+
+func TestLoadFromDisk_RuntimeRecovery(t *testing.T) {
+	sp := tmpStoragePath(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer ts.Close()
+
+	c, err := New(Options{
+		APIKey:        "test",
+		Endpoint:      ts.URL,
+		FlushInterval: 1 * time.Hour,
+		BatchSize:     1000,
+		StoragePath:   sp,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Shutdown(context.Background())
+
+	// Simulate events persisted to disk mid-process
+	events := []RequestEvent{makeEvent()}
+	data, _ := json.Marshal(events)
+	os.WriteFile(sp, append(data, '\n'), 0600)
+
+	// Trigger runtime recovery on the same client
+	c.loadFromDisk()
+
+	if c.BufferLen() != 1 {
+		t.Fatalf("expected 1 recovered event, got %d", c.BufferLen())
 	}
 }
 

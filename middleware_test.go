@@ -1,4 +1,4 @@
-package apidash
+package peekapi
 
 import (
 	"context"
@@ -423,5 +423,104 @@ func TestMiddleware_CustomerHandlerSees200AfterRecovery(t *testing.T) {
 		if w.Code != 201 {
 			t.Errorf("request %d: expected status 201, got %d", i, w.Code)
 		}
+	}
+}
+
+// ─── CollectQueryString ──────────────────────────────────────────────────────
+
+func TestMiddleware_CollectQueryString_Disabled(t *testing.T) {
+	ingestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer ingestServer.Close()
+
+	c := newMiddlewareTestClient(t, ingestServer.URL)
+
+	handler := Middleware(c)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/search?z=3&a=1", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	c.bufMu.Lock()
+	e := c.buffer[0]
+	c.bufMu.Unlock()
+
+	if e.Path != "/search" {
+		t.Errorf("expected path '/search', got '%s'", e.Path)
+	}
+}
+
+func TestMiddleware_CollectQueryString_Enabled(t *testing.T) {
+	ingestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer ingestServer.Close()
+
+	c, err := New(Options{
+		APIKey:             "ak_test_key",
+		Endpoint:           ingestServer.URL,
+		FlushInterval:      1 * time.Hour,
+		BatchSize:          1000,
+		StoragePath:        tmpStoragePath(t),
+		CollectQueryString: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Shutdown(context.Background())
+
+	handler := Middleware(c)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/search?z=3&a=1", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	c.bufMu.Lock()
+	e := c.buffer[0]
+	c.bufMu.Unlock()
+
+	if e.Path != "/search?a=1&z=3" {
+		t.Errorf("expected path '/search?a=1&z=3', got '%s'", e.Path)
+	}
+}
+
+func TestMiddleware_CollectQueryString_NoQueryString(t *testing.T) {
+	ingestServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer ingestServer.Close()
+
+	c, err := New(Options{
+		APIKey:             "ak_test_key",
+		Endpoint:           ingestServer.URL,
+		FlushInterval:      1 * time.Hour,
+		BatchSize:          1000,
+		StoragePath:        tmpStoragePath(t),
+		CollectQueryString: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Shutdown(context.Background())
+
+	handler := Middleware(c)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	c.bufMu.Lock()
+	e := c.buffer[0]
+	c.bufMu.Unlock()
+
+	if e.Path != "/users" {
+		t.Errorf("expected path '/users', got '%s'", e.Path)
 	}
 }
