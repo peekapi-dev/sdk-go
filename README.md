@@ -163,6 +163,8 @@ if err := client.Shutdown(ctx); err != nil {
 
 ## Contributing
 
+Bug reports and feature requests: [peekapi-dev/community](https://github.com/peekapi-dev/community/issues)
+
 1. Fork & clone the repo
 2. Run tests — `go test ./...`
 3. Lint — `go vet ./...`
